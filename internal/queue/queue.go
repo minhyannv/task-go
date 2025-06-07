@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"task-go/internal/redis"
-	"task-go/pkg/task"
+	"github.com/minhyannv/task-go/internal/redis"
+	"github.com/minhyannv/task-go/pkg/task"
 
 	goredis "github.com/redis/go-redis/v9"
 )

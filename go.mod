@@ -1,4 +1,4 @@
-module task-go
+module github.com/minhyannv/task-go
 
 go 1.21
 

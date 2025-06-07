@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"task-go/pkg/task"
+	"github.com/minhyannv/task-go/pkg/task"
 
 	"github.com/redis/go-redis/v9"
 )

@@ -5,9 +5,9 @@ import (
 	"context"
 	"time"
 
-	"task-go/internal/queue"
-	"task-go/internal/redis"
-	"task-go/pkg/task"
+	"github.com/minhyannv/task-go/internal/queue"
+	"github.com/minhyannv/task-go/internal/redis"
+	"github.com/minhyannv/task-go/pkg/task"
 )
 
 // QueueType 队列类型别名

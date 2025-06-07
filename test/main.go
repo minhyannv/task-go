@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	taskqueue "task-go"
-	"task-go/pkg/task"
+	taskqueue "github.com/minhyannv/task-go"
+	"github.com/minhyannv/task-go/pkg/task"
 )
 
 // 测试配置

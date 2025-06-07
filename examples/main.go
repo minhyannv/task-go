@@ -6,8 +6,8 @@ import (
 	"log"
 	"time"
 
-	taskqueue "task-go"
-	"task-go/pkg/task"
+	taskqueue "github.com/minhyannv/task-go"
+	"github.com/minhyannv/task-go/pkg/task"
 )
 
 func main() {

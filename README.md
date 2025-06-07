@@ -38,7 +38,7 @@ TaskGo 架构
 
 ```bash
 go mod init your-project
-go get task-go
+go get github.com/minhyannv/task-go
 ```
 
 ### 基础使用
@@ -53,8 +53,8 @@ import (
     "log"
     "time"
     
-    taskqueue "task-go"
-    "task-go/pkg/task"
+    taskqueue "github.com/minhyannv/task-go"
+    "github.com/minhyannv/task-go/pkg/task"
 )
 
 func main() {
