@@ -17,7 +17,7 @@ func main() {
 
 	// Redis 连接信息
 	redisAddr := "localhost:6379"
-	redisPass := "8PKtAj9TDIuqAuAAL5w7"
+	redisPass := "123456"
 	redisDB := 0
 
 	// 示例1: 简单队列 - FIFO 处理
