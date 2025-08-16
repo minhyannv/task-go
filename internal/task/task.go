@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"strconv"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 // TaskStatus 任务状态枚举
@@ -15,7 +13,6 @@ type TaskStatus string
 const (
 	StatusPending TaskStatus = "pending"
 	StatusRunning TaskStatus = "running"
-	StatusStopped TaskStatus = "stopped"
 	StatusDone    TaskStatus = "done"
 	StatusFailed  TaskStatus = "failed"
 )
@@ -23,7 +20,7 @@ const (
 // Task 任务结构体
 type Task struct {
 	ID         string     `json:"id"`          // 任务唯一标识
-	Name       string     `json:"name"`        // 任务名称
+	Type       string     `json:"type"`        // 任务类型
 	Payload    string     `json:"payload"`     // 任务载荷（JSON 字符串）
 	Status     TaskStatus `json:"status"`      // 任务状态
 	CreatedAt  time.Time  `json:"created_at"`  // 创建时间
@@ -33,44 +30,30 @@ type Task struct {
 	Result     string     `json:"result"`      // 执行结果
 	ErrorMsg   string     `json:"error_msg"`   // 错误信息
 
-	// 新增字段
-	RetryCount int           `json:"retry_count"` // 重试次数
-	Timeout    time.Duration `json:"timeout"`     // 超时时间
-	Priority   int           `json:"priority"`    // 优先级
-	UniqueKey  string        `json:"unique_key"`  // 唯一键
+	Retry    int           `json:"retry_count"` // 重试次数
+	Timeout  time.Duration `json:"timeout"`     // 超时时间
+	Delay    time.Duration `json:"delay"`       // 延迟执行时间
+	Priority int           `json:"priority"`    // 优先级
 }
 
 // TaskHandler 任务处理函数类型
-type TaskHandler func(ctx context.Context, task *Task) error
-
-// NewTask 创建新任务
-func NewTask(name, payload string) *Task {
-	now := time.Now()
-	return &Task{
-		ID:        uuid.New().String(),
-		Name:      name,
-		Payload:   payload,
-		Status:    StatusPending,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
+type TaskHandler func(ctx context.Context, task *Task) (string, error)
 
 // ToMap 将任务转换为 map，用于存储到 Redis Hash
 func (t *Task) ToMap() map[string]interface{} {
 	data := map[string]interface{}{
-		"id":          t.ID,
-		"name":        t.Name,
-		"payload":     t.Payload,
-		"status":      string(t.Status),
-		"created_at":  t.CreatedAt.Unix(),
-		"updated_at":  t.UpdatedAt.Unix(),
-		"result":      t.Result,
-		"error_msg":   t.ErrorMsg,
-		"retry_count": t.RetryCount,
-		"timeout":     int64(t.Timeout.Seconds()),
-		"priority":    t.Priority,
-		"unique_key":  t.UniqueKey,
+		"id":         t.ID,
+		"type":       t.Type,
+		"payload":    t.Payload,
+		"status":     string(t.Status),
+		"created_at": t.CreatedAt.Unix(),
+		"updated_at": t.UpdatedAt.Unix(),
+		"result":     t.Result,
+		"error_msg":  t.ErrorMsg,
+		"retry":      t.Retry,
+		"timeout":    int64(t.Timeout.Seconds()),
+		"delay":      int64(t.Delay.Seconds()),
+		"priority":   t.Priority,
 	}
 
 	if t.StartedAt != nil {
@@ -86,52 +69,51 @@ func (t *Task) ToMap() map[string]interface{} {
 // FromMap 从 map 构建任务对象，用于从 Redis Hash 读取
 func (t *Task) FromMap(data map[string]string) error {
 	t.ID = data["id"]
-	t.Name = data["name"]
+	t.Type = data["type"]
 	t.Payload = data["payload"]
 	t.Status = TaskStatus(data["status"])
 	t.Result = data["result"]
 	t.ErrorMsg = data["error_msg"]
-	t.UniqueKey = data["unique_key"]
 
-	// 解析数值字段
-	if retryStr, ok := data["retry_count"]; ok && retryStr != "" {
+	// 解析数值字段（字符串 -> 数字）
+	if retryStr, ok := data["retry"]; ok && retryStr != "" {
 		if retry, err := strconv.Atoi(retryStr); err == nil {
-			t.RetryCount = retry
+			t.Retry = retry
 		}
 	}
-
 	if timeoutStr, ok := data["timeout"]; ok && timeoutStr != "" {
-		if timeout, err := strconv.ParseInt(timeoutStr, 10, 64); err == nil {
+		if timeout, err := strconv.Atoi(timeoutStr); err == nil {
 			t.Timeout = time.Duration(timeout) * time.Second
 		}
 	}
-
+	if delayStr, ok := data["delay"]; ok && delayStr != "" {
+		if delay, err := strconv.Atoi(delayStr); err == nil {
+			t.Delay = time.Duration(delay) * time.Second
+		}
+	}
 	if priorityStr, ok := data["priority"]; ok && priorityStr != "" {
 		if priority, err := strconv.Atoi(priorityStr); err == nil {
 			t.Priority = priority
 		}
 	}
 
-	// 解析时间戳
+	// 解析时间戳（字符串 -> int64 -> time.Time）
 	if createdStr, ok := data["created_at"]; ok && createdStr != "" {
 		if created, err := strconv.ParseInt(createdStr, 10, 64); err == nil {
 			t.CreatedAt = time.Unix(created, 0)
 		}
 	}
-
 	if updatedStr, ok := data["updated_at"]; ok && updatedStr != "" {
 		if updated, err := strconv.ParseInt(updatedStr, 10, 64); err == nil {
 			t.UpdatedAt = time.Unix(updated, 0)
 		}
 	}
-
 	if startedStr, ok := data["started_at"]; ok && startedStr != "" {
 		if started, err := strconv.ParseInt(startedStr, 10, 64); err == nil {
 			startedTime := time.Unix(started, 0)
 			t.StartedAt = &startedTime
 		}
 	}
-
 	if finishedStr, ok := data["finished_at"]; ok && finishedStr != "" {
 		if finished, err := strconv.ParseInt(finishedStr, 10, 64); err == nil {
 			finishedTime := time.Unix(finished, 0)
@@ -148,41 +130,42 @@ func (t *Task) ToJSON() (string, error) {
 	return string(data), err
 }
 
-// UpdateStatus 更新任务状态
-func (t *Task) UpdateStatus(status TaskStatus) {
-	t.Status = status
-	t.UpdatedAt = time.Now()
+//
+//// UpdateStatus 更新任务状态
+//func (t *Task) UpdateStatus(status TaskStatus) {
+//	t.Status = status
+//	t.UpdatedAt = time.Now()
+//
+//	switch status {
+//	case StatusRunning:
+//		now := time.Now()
+//		t.StartedAt = &now
+//	case StatusDone, StatusFailed:
+//		now := time.Now()
+//		t.FinishedAt = &now
+//	}
+//}
+//
+//// SetResult 设置任务执行结果
+//func (t *Task) SetResult(result string) {
+//	t.Result = result
+//	t.UpdatedAt = time.Now()
+//}
+//
+//// SetError 设置任务错误信息
+//func (t *Task) SetError(errMsg string) {
+//	t.ErrorMsg = errMsg
+//	t.UpdateStatus(StatusFailed)
+//}
 
-	switch status {
-	case StatusRunning:
-		now := time.Now()
-		t.StartedAt = &now
-	case StatusDone, StatusFailed:
-		now := time.Now()
-		t.FinishedAt = &now
-	}
+// SetRetry 设置重试次数
+func (t *Task) SetRetry(count int) {
+	t.Retry = count
 }
 
-// SetResult 设置任务执行结果
-func (t *Task) SetResult(result string) {
-	t.Result = result
-	t.UpdatedAt = time.Now()
-}
-
-// SetError 设置任务错误信息
-func (t *Task) SetError(errMsg string) {
-	t.ErrorMsg = errMsg
-	t.UpdateStatus(StatusFailed)
-}
-
-// SetRetryCount 设置重试次数
-func (t *Task) SetRetryCount(count int) {
-	t.RetryCount = count
-}
-
-// GetRetryCount 获取重试次数
-func (t *Task) GetRetryCount() int {
-	return t.RetryCount
+// GetRetry 获取重试次数
+func (t *Task) GetRetry() int {
+	return t.Retry
 }
 
 // SetTimeout 设置超时时间
@@ -209,14 +192,4 @@ func (t *Task) GetPriority() int {
 		return 5 // 默认优先级
 	}
 	return t.Priority
-}
-
-// SetUniqueKey 设置唯一键
-func (t *Task) SetUniqueKey(key string) {
-	t.UniqueKey = key
-}
-
-// GetUniqueKey 获取唯一键
-func (t *Task) GetUniqueKey() string {
-	return t.UniqueKey
 }

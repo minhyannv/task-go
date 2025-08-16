@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/minhyannv/task-go/pkg/task"
+	"github.com/minhyannv/task-go/internal/task"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -45,7 +45,7 @@ func (c *Client) Ping(ctx context.Context) error {
 // SaveTask 保存任务到 Redis Hash
 func (c *Client) SaveTask(ctx context.Context, t *task.Task) error {
 	key := c.taskKey(t.ID)
-	return c.rdb.HMSet(ctx, key, t.ToMap()).Err()
+	return c.rdb.HSet(ctx, key, t.ToMap()).Err()
 }
 
 // GetTask 从 Redis Hash 获取任务
@@ -68,46 +68,39 @@ func (c *Client) GetTask(ctx context.Context, taskID string) (*task.Task, error)
 	return t, nil
 }
 
-// UpdateTaskStatus 更新任务状态
-func (c *Client) UpdateTaskStatus(ctx context.Context, taskID string, status task.TaskStatus) error {
+// TaskRun 任务执行
+func (c *Client) TaskRun(ctx context.Context, taskID string) error {
 	key := c.taskKey(taskID)
 	now := time.Now().Unix()
 
-	pipe := c.rdb.Pipeline()
-	pipe.HSet(ctx, key, "status", string(status))
-	pipe.HSet(ctx, key, "updated_at", now)
-
-	// 根据状态设置特定时间戳
-	switch status {
-	case task.StatusRunning:
-		pipe.HSet(ctx, key, "started_at", now)
-	case task.StatusDone, task.StatusFailed:
-		pipe.HSet(ctx, key, "finished_at", now)
-	}
-
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
-// UpdateTaskResult 更新任务结果
-func (c *Client) UpdateTaskResult(ctx context.Context, taskID, result string) error {
-	key := c.taskKey(taskID)
-	now := time.Now().Unix()
-
-	return c.rdb.HMSet(ctx, key, map[string]interface{}{
-		"result":     result,
+	return c.rdb.HSet(ctx, key, map[string]interface{}{
+		"status":     string(task.StatusRunning),
 		"updated_at": now,
+		"started_at": now,
 	}).Err()
 }
 
-// UpdateTaskError 更新任务错误信息
-func (c *Client) UpdateTaskError(ctx context.Context, taskID, errorMsg string) error {
+// TaskSuccess 更新任务结果
+func (c *Client) TaskSuccess(ctx context.Context, taskID, result string) error {
 	key := c.taskKey(taskID)
 	now := time.Now().Unix()
 
-	return c.rdb.HMSet(ctx, key, map[string]interface{}{
-		"error_msg":   errorMsg,
+	return c.rdb.HSet(ctx, key, map[string]interface{}{
+		"status":      string(task.StatusDone),
+		"result":      result,
+		"updated_at":  now,
+		"finished_at": now,
+	}).Err()
+}
+
+// TaskError 更新任务错误信息
+func (c *Client) TaskError(ctx context.Context, taskID, errorMsg string) error {
+	key := c.taskKey(taskID)
+	now := time.Now().Unix()
+
+	return c.rdb.HSet(ctx, key, map[string]interface{}{
 		"status":      string(task.StatusFailed),
+		"error_msg":   errorMsg,
 		"updated_at":  now,
 		"finished_at": now,
 	}).Err()
@@ -182,13 +175,6 @@ func (c *Client) taskKey(taskID string) string {
 // GetClient 获取原始 Redis 客户端（用于高级操作）
 func (c *Client) GetClient() *redis.Client {
 	return c.rdb
-}
-
-// CheckUniqueJob 检查任务唯一性
-func (c *Client) CheckUniqueJob(ctx context.Context, uniqueKey string) (bool, error) {
-	key := "unique:" + uniqueKey
-	count, err := c.rdb.Exists(ctx, key).Result()
-	return count > 0, err
 }
 
 // EnqueueTaskWithPriority 将任务加入优先级队列
@@ -285,7 +271,7 @@ func (c *Client) GetDelayedTaskCount(ctx context.Context) (int64, error) {
 // UpdateTask 更新任务信息
 func (c *Client) UpdateTask(ctx context.Context, t *task.Task) error {
 	key := c.taskKey(t.ID)
-	return c.rdb.HMSet(ctx, key, t.ToMap()).Err()
+	return c.rdb.HSet(ctx, key, t.ToMap()).Err()
 }
 
 // DequeueFromReadyQueue 从ready队列中取出任务（延迟队列专用）
