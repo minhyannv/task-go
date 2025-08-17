@@ -1,21 +1,27 @@
-// Package taskgo 提供轻量级异步任务队列功能
 package pkg
 
 import (
 	"context"
-	"github.com/minhyannv/task-go/internal/models"
-	"go.uber.org/zap"
-	"log"
+	"github.com/minhyannv/task-go/internal/handler_manager"
+	"os"
+	"strconv"
 	"time"
 
+	"github.com/minhyannv/task-go/internal/models"
+	"github.com/minhyannv/task-go/internal/task_manager"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+
+	_ "github.com/joho/godotenv/autoload"
 	"github.com/minhyannv/task-go/internal/queue"
-	"github.com/minhyannv/task-go/internal/redis"
 	"github.com/minhyannv/task-go/internal/task"
 )
 
 // TaskQueue 任务队列主接口
 type TaskQueue struct {
-	queue *queue.Queue
+	redisClient    *redis.Client
+	queue          *queue.Queue
+	handlerManager *handler_manager.HandlerManager
 }
 
 // Config 队列配置
@@ -32,7 +38,7 @@ type Config struct {
 }
 
 // NewTaskQueue 创建新的任务队列
-func NewTaskQueue(config *Config) (*TaskQueue, error) {
+func NewTaskQueue(ctx context.Context, logger *zap.Logger, config *Config) (*TaskQueue, error) {
 	// 设置默认配置
 	if config == nil {
 		config = &Config{
@@ -47,36 +53,53 @@ func NewTaskQueue(config *Config) (*TaskQueue, error) {
 		}
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr != "" {
+		config.RedisAddr = redisAddr
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	if redisPassword != "" {
+		config.RedisPassword = redisPassword
+	}
+	redisDB := os.Getenv("REDIS_DB")
+	if redisDB != "" {
+		atoi, err := strconv.Atoi(redisDB)
+		if err != nil {
+			return nil, err
+		}
+		config.RedisDB = atoi
+	}
 	// 创建 Redis 客户端
-	redisClient := redis.NewClient(config.RedisAddr, config.RedisPassword, config.RedisDB)
-
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     config.RedisAddr,
+		Password: config.RedisPassword,
+		DB:       config.RedisDB,
+	})
 	// 测试连接
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	toctx, tocancel := context.WithTimeout(ctx, 5*time.Second)
+	defer tocancel()
 
-	if err := redisClient.Ping(ctx); err != nil {
+	if _, err := redisClient.Ping(toctx).Result(); err != nil {
 		return nil, err
 	}
-
-	logger, err := zap.NewProduction()
-	if err != nil {
-		log.Fatal(err)
-	}
-	queue := queue.NewQueue(ctx, logger, redisClient, config.QueueType)
+	taskManager := task_manager.NewTaskManager(redisClient)
+	handlerManager := handler_manager.NewHandlerManager(logger)
+	queue := queue.NewQueue(ctx, logger, taskManager, handlerManager, config.QueueType, config.WorkerNumber)
 
 	return &TaskQueue{
-		queue: queue,
+		redisClient:    redisClient,
+		queue:          queue,
+		handlerManager: handlerManager,
 	}, nil
 }
 
 // RegisterHandler 注册任务处理器
-func (tq *TaskQueue) RegisterHandler(taskType string, handler task.TaskHandler) {
-	tq.queue.RegisterHandler(taskType, handler)
-
+func (tq *TaskQueue) RegisterHandler(taskType string, handler task.TaskHandler) error {
+	return tq.handlerManager.RegisterHandler(taskType, handler)
 }
 
 // Submit 提交任务
-func (tq *TaskQueue) Submit(ctx context.Context, taskType string, payload string, opts *queue.TaskOptions) (string, error) {
+func (tq *TaskQueue) Submit(ctx context.Context, taskType string, payload string, opts *task.TaskOptions) (string, error) {
 	return tq.queue.Submit(ctx, taskType, payload, opts)
 }
 
@@ -89,9 +112,10 @@ func (tq *TaskQueue) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop 停止队列
+// Stop 停止任务队列
 func (tq *TaskQueue) Stop() {
 	tq.queue.Stop()
+	tq.redisClient.Close()
 }
 
 // GetQueueStats 获取队列统计信息
@@ -100,7 +124,7 @@ func (tq *TaskQueue) GetQueueStats(ctx context.Context) (map[string]interface{},
 }
 
 // NewSimpleTaskQueue 创建简单队列（FIFO）
-func NewSimpleTaskQueue(redisAddr, password string, db int) (*TaskQueue, error) {
+func NewSimpleTaskQueue(ctx context.Context, logger *zap.Logger, redisAddr, password string, db int) (*TaskQueue, error) {
 	config := &Config{
 		RedisAddr:       redisAddr,
 		RedisPassword:   password,
@@ -112,11 +136,11 @@ func NewSimpleTaskQueue(redisAddr, password string, db int) (*TaskQueue, error) 
 		DefaultPriority: 5,
 		WorkerNumber:    5,
 	}
-	return NewTaskQueue(config)
+	return NewTaskQueue(ctx, logger, config)
 }
 
 // NewDelayedTaskQueue 创建延迟队列
-func NewDelayedTaskQueue(redisAddr, password string, db int) (*TaskQueue, error) {
+func NewDelayedTaskQueue(ctx context.Context, logger *zap.Logger, redisAddr, password string, db int) (*TaskQueue, error) {
 	config := &Config{
 		RedisAddr:       redisAddr,
 		RedisPassword:   password,
@@ -128,11 +152,11 @@ func NewDelayedTaskQueue(redisAddr, password string, db int) (*TaskQueue, error)
 		DefaultPriority: 5,
 		WorkerNumber:    5,
 	}
-	return NewTaskQueue(config)
+	return NewTaskQueue(ctx, logger, config)
 }
 
 // NewPriorityTaskQueue 创建优先级队列
-func NewPriorityTaskQueue(redisAddr, password string, db int) (*TaskQueue, error) {
+func NewPriorityTaskQueue(ctx context.Context, logger *zap.Logger, redisAddr, password string, db int) (*TaskQueue, error) {
 	config := &Config{
 		RedisAddr:       redisAddr,
 		RedisPassword:   password,
@@ -144,5 +168,5 @@ func NewPriorityTaskQueue(redisAddr, password string, db int) (*TaskQueue, error
 		DefaultPriority: 5,
 		WorkerNumber:    5,
 	}
-	return NewTaskQueue(config)
+	return NewTaskQueue(ctx, logger, config)
 }

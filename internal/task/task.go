@@ -3,32 +3,31 @@ package task
 import (
 	"context"
 	"encoding/json"
+	"github.com/minhyannv/task-go/internal/models"
 	"strconv"
 	"time"
 )
 
-// TaskStatus 任务状态枚举
-type TaskStatus string
-
-const (
-	StatusPending TaskStatus = "pending"
-	StatusRunning TaskStatus = "running"
-	StatusDone    TaskStatus = "done"
-	StatusFailed  TaskStatus = "failed"
-)
+// TaskOptions 任务选项
+type TaskOptions struct {
+	Retry    int           // 重试次数
+	Timeout  time.Duration // 超时时间
+	Delay    time.Duration // 延迟执行时间 (仅延迟队列有效)
+	Priority int           // 优先级 (仅优先级队列有效, 1-10, 10最高)
+}
 
 // Task 任务结构体
 type Task struct {
-	ID         string     `json:"id"`          // 任务唯一标识
-	Type       string     `json:"type"`        // 任务类型
-	Payload    string     `json:"payload"`     // 任务载荷（JSON 字符串）
-	Status     TaskStatus `json:"status"`      // 任务状态
-	CreatedAt  time.Time  `json:"created_at"`  // 创建时间
-	UpdatedAt  time.Time  `json:"updated_at"`  // 更新时间
-	StartedAt  *time.Time `json:"started_at"`  // 开始执行时间
-	FinishedAt *time.Time `json:"finished_at"` // 完成时间
-	Result     string     `json:"result"`      // 执行结果
-	ErrorMsg   string     `json:"error_msg"`   // 错误信息
+	ID         string            `json:"id"`          // 任务唯一标识
+	Type       string            `json:"type"`        // 任务类型
+	Payload    string            `json:"payload"`     // 任务载荷（JSON 字符串）
+	Status     models.TaskStatus `json:"status"`      // 任务状态
+	CreatedAt  time.Time         `json:"created_at"`  // 创建时间
+	UpdatedAt  time.Time         `json:"updated_at"`  // 更新时间
+	StartedAt  *time.Time        `json:"started_at"`  // 开始执行时间
+	FinishedAt *time.Time        `json:"finished_at"` // 完成时间
+	Result     string            `json:"result"`      // 执行结果
+	ErrorMsg   string            `json:"error_msg"`   // 错误信息
 
 	Retry    int           `json:"retry_count"` // 重试次数
 	Timeout  time.Duration `json:"timeout"`     // 超时时间
@@ -71,7 +70,7 @@ func (t *Task) FromMap(data map[string]string) error {
 	t.ID = data["id"]
 	t.Type = data["type"]
 	t.Payload = data["payload"]
-	t.Status = TaskStatus(data["status"])
+	t.Status = models.TaskStatus(data["status"])
 	t.Result = data["result"]
 	t.ErrorMsg = data["error_msg"]
 

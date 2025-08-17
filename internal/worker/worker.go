@@ -2,46 +2,49 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/minhyannv/task-go/internal/models"
-	"github.com/minhyannv/task-go/internal/redis"
-	"github.com/minhyannv/task-go/internal/task"
-	"go.uber.org/zap"
+	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/minhyannv/task-go/internal/handler_manager"
+	"github.com/minhyannv/task-go/internal/models"
+	"github.com/minhyannv/task-go/internal/task"
+	"github.com/minhyannv/task-go/internal/task_manager"
+	"go.uber.org/zap"
 )
 
 // Worker 队列工作器
 type Worker struct {
-	ctx       context.Context
-	logger    *zap.Logger
-	id        string
-	queueType models.QueueType
-	redis     *redis.Client
-
-	handlers map[string]task.TaskHandler
-	mu       sync.RWMutex
-	running  bool
-	stopCh   chan struct{}
+	ctx            context.Context
+	logger         *zap.Logger
+	id             string
+	queueType      models.QueueType
+	taskManager    *task_manager.TaskManager
+	handlerManager *handler_manager.HandlerManager
+	mu             sync.RWMutex
+	running        bool
+	stopCh         chan struct{}
 }
 
-func NewWorker(ctx context.Context, logger *zap.Logger, id string, queueType models.QueueType, redis *redis.Client) *Worker {
+func NewWorker(ctx context.Context, logger *zap.Logger, id string, queueType models.QueueType, taskManager *task_manager.TaskManager, handlerManager *handler_manager.HandlerManager) *Worker {
 	return &Worker{
-		ctx:       ctx,
-		logger:    logger.With(zap.String("workId", id)),
-		id:        id,
-		queueType: queueType,
-		redis:     redis,
-		handlers:  make(map[string]task.TaskHandler),
-		running:   false,
-		stopCh:    make(chan struct{}),
+		ctx:            ctx,
+		logger:         logger.With(zap.String("worker_id", id)),
+		id:             id,
+		queueType:      queueType,
+		taskManager:    taskManager,
+		handlerManager: handlerManager,
+		running:        false,
+		stopCh:         make(chan struct{}),
 	}
 }
 
 // Run 工作器运行
 func (w *Worker) Run(ctx context.Context) {
 	if w.running == true {
-		w.logger.Sugar().Warnf("worker: %s are running", w.id)
+		w.logger.Sugar().Warnf("工作器: %s 已经在运行", w.id)
 		return
 	}
 	w.running = true
@@ -57,15 +60,15 @@ func (w *Worker) Run(ctx context.Context) {
 			return
 		default:
 			if err := w.processNextTask(ctx); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
+				w.logger.Sugar().Errorf("w.processNextTask error: %v", err)
 				// 短暂休眠避免过度轮询
 				select {
 				case <-time.After(time.Second):
 				case <-w.stopCh:
+					w.logger.Sugar().Warnf("chan stop, return")
 					return
 				case <-ctx.Done():
+					w.logger.Sugar().Warnf("ctx done, return")
 					return
 				}
 			}
@@ -81,40 +84,38 @@ func (w *Worker) processNextTask(ctx context.Context) error {
 	// 根据队列类型获取任务
 	switch w.queueType {
 	case models.SimpleQueue:
-		taskID, err = w.redis.DequeueTask(ctx, time.Second)
+		taskID, err = w.taskManager.DequeueTask(ctx, time.Second)
 	case models.DelayedQueue:
 		// 延迟队列从ready队列获取已到期的任务
-		taskID, err = w.redis.DequeueFromReadyQueue(ctx, time.Second)
+		taskID, err = w.taskManager.DequeueFromReadyQueue(ctx, time.Second)
 	case models.PriorityQueue:
-		taskID, err = w.redis.DequeueTaskWithPriority(ctx, time.Second)
+		taskID, err = w.taskManager.DequeueTaskWithPriority(ctx, time.Second)
 	default:
 		return fmt.Errorf("不支持的队列类型: %s", w.queueType)
 	}
 
 	if err != nil {
-		if err.Error() == "redis: nil" {
+		if errors.Is(err, redis.Nil) {
 			return nil // 队列为空，继续轮询
 		}
+		w.logger.Sugar().Errorf("获取任务失败: %v", err)
 		return fmt.Errorf("获取任务失败: %w", err)
 	}
 
 	// 获取任务详情
-	t, err := w.redis.GetTask(ctx, taskID)
+	t, err := w.taskManager.GetTask(ctx, taskID)
 	if err != nil {
-		w.logger.Sugar().Infof("获取任务 %s 详情失败: %v", taskID, err)
-		return nil
+		w.logger.Sugar().Errorf("获取任务 %s 详情失败: %v", taskID, err)
+		return fmt.Errorf("获取任务 %s 详情失败: %v", taskID, err)
 	}
+	w.logger.Sugar().Infof("获取任务信息 : %+v", t)
 
 	// 查找处理器
-	w.mu.Lock()
-	handler, exists := w.handlers[t.Type]
-	w.mu.Unlock()
-
-	w.logger.Sugar().Infof("获取任务信息 : %+v", t)
+	handler, exists := w.handlerManager.GetHandler(t.Type)
 	if !exists {
 		w.logger.Sugar().Infof("未找到任务类型 %s 的处理器: %s", taskID, t.Type)
 		// 更新任务状态
-		err = w.redis.TaskError(ctx, taskID, fmt.Sprintf("未找到处理器: %s", t.Type))
+		err = w.taskManager.TaskError(ctx, taskID, fmt.Sprintf("未找到处理器: %s", t.Type))
 		if err != nil {
 			w.logger.Sugar().Errorf("更新任务失败状态失败: %v", err)
 		}
@@ -131,8 +132,9 @@ func (w *Worker) executeTaskWithRetry(ctx context.Context, t *task.Task, handler
 	timeout := t.GetTimeout()
 
 	// 更新任务状态：运行中
-	if err := w.redis.TaskRun(ctx, t.ID); err != nil {
-		w.logger.Sugar().Infof("更新任务状态失败: %v", err)
+	if err := w.taskManager.TaskRun(ctx, t.ID); err != nil {
+		w.logger.Sugar().Errorf("更新任务状态失败: %v", err)
+		return err
 	}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -151,7 +153,7 @@ func (w *Worker) executeTaskWithRetry(ctx context.Context, t *task.Task, handler
 		res, err := w.executeTaskOnce(ctx, t, handler, timeout)
 		if err == nil {
 			// 更新任务状态：已完成
-			if updateErr := w.redis.TaskSuccess(ctx, t.ID, res); updateErr != nil {
+			if updateErr := w.taskManager.TaskSuccess(ctx, t.ID, res); updateErr != nil {
 				w.logger.Sugar().Errorf("更新任务完成状态失败: %v", updateErr)
 			}
 			w.logger.Sugar().Infof("任务 %s 执行成功 (队列: %s)", t.ID, w.queueType)
@@ -163,7 +165,7 @@ func (w *Worker) executeTaskWithRetry(ctx context.Context, t *task.Task, handler
 		// 最后一次尝试失败
 		if attempt == maxRetries {
 			// 更新任务状态：已失败
-			err = w.redis.TaskError(ctx, t.ID, err.Error())
+			err = w.taskManager.TaskError(ctx, t.ID, err.Error())
 			if err != nil {
 				w.logger.Sugar().Errorf("更新任务失败状态失败: %v", err)
 			}
@@ -196,19 +198,11 @@ func (w *Worker) executeTaskOnce(ctx context.Context, t *task.Task, handler task
 		return "", err
 	case res := <-resChan:
 		return res, nil
-
 	case <-timeoutCtx.Done():
 		return "", fmt.Errorf("任务执行超时")
 	}
 }
 
-// RegisterHandler 注册任务处理器
-func (w *Worker) RegisterHandler(taskType string, handler task.TaskHandler) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.handlers[taskType] = handler
-	w.logger.Sugar().Infof("已注册任务处理器: %s (队列类型: %s)", taskType, w.queueType)
-}
-func (w *Worker) Close() {
+func (w *Worker) Stop() {
 	close(w.stopCh)
 }

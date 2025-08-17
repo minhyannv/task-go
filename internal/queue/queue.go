@@ -3,32 +3,34 @@ package queue
 import (
 	"context"
 	"fmt"
-	"github.com/google/uuid"
-	"github.com/minhyannv/task-go/internal/models"
-	"github.com/minhyannv/task-go/internal/worker"
 	"log"
 	"sync"
 	"time"
 
-	"github.com/minhyannv/task-go/internal/redis"
+	"github.com/google/uuid"
+	"github.com/minhyannv/task-go/internal/handler_manager"
+	"github.com/minhyannv/task-go/internal/models"
+	"github.com/minhyannv/task-go/internal/task_manager"
+	"github.com/minhyannv/task-go/internal/worker"
+	"github.com/redis/go-redis/v9"
+
 	"github.com/minhyannv/task-go/internal/task"
-	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
 
 // Queue 队列
 type Queue struct {
-	ctx       context.Context
-	logger    *zap.Logger
-	redis     *redis.Client
-	queueType models.QueueType // 队列类型
+	ctx            context.Context
+	logger         *zap.Logger
+	taskManager    *task_manager.TaskManager
+	handlerManager *handler_manager.HandlerManager
+	queueType      models.QueueType // 队列类型
 
-	workers  map[string]*worker.Worker
-	handlers map[string]task.TaskHandler
-	running  bool
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.RWMutex
+	workers map[string]*worker.Worker
+	running bool
+	stopCh  chan struct{}
+	wg      sync.WaitGroup
+	mu      sync.RWMutex
 
 	// 配置选项
 	defaultRetry    int           // 任务执行失败重试次数，默认：3
@@ -39,48 +41,29 @@ type Queue struct {
 	workerNumber int // 工作器数量
 }
 
-// TaskOptions 任务选项
-type TaskOptions struct {
-	Retry    int           // 重试次数
-	Timeout  time.Duration // 超时时间
-	Delay    time.Duration // 延迟执行时间 (仅延迟队列有效)
-	Priority int           // 优先级 (仅优先级队列有效, 1-10, 10最高)
-}
-
 // NewQueue 创建队列
-func NewQueue(ctx context.Context, logger *zap.Logger, redisClient *redis.Client, queueType models.QueueType) *Queue {
+func NewQueue(ctx context.Context, logger *zap.Logger, taskManager *task_manager.TaskManager, handlerManager *handler_manager.HandlerManager, queueType models.QueueType, workerNumber int) *Queue {
 	return &Queue{
 		ctx:            ctx,
 		logger:         logger,
-		redis:          redisClient,
+		taskManager:    taskManager,
+		handlerManager: handlerManager,
 		workers:        make(map[string]*worker.Worker),
-		handlers:       make(map[string]task.TaskHandler),
 		stopCh:         make(chan struct{}),
 		defaultRetry:   3,
 		defaultTimeout: 30 * time.Second,
 		defaultDelay:   1 * time.Second,
-		workerNumber:   10,
+		workerNumber:   workerNumber,
 		queueType:      queueType,
 	}
 }
 
-// RegisterHandler 注册任务处理器
-func (q *Queue) RegisterHandler(taskType string, handler task.TaskHandler) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.handlers[taskType] = handler
-	q.logger.Sugar().Infof("已注册任务处理器: %s (队列类型: %s)", taskType, q.queueType)
-	for _, worker := range q.workers {
-		worker.RegisterHandler(taskType, handler)
-	}
-}
-
 // Submit 提交任务到指定类型的队列
-func (q *Queue) Submit(ctx context.Context, taskType string, payload string, opts *TaskOptions) (string, error) {
+func (q *Queue) Submit(ctx context.Context, taskType string, payload string, opts *task.TaskOptions) (string, error) {
 
 	// 设置默认选项
 	if opts == nil {
-		opts = &TaskOptions{}
+		opts = &task.TaskOptions{}
 	}
 	if opts.Retry == 0 {
 		opts.Retry = q.defaultRetry
@@ -100,7 +83,7 @@ func (q *Queue) Submit(ctx context.Context, taskType string, payload string, opt
 		ID:        uuid.New().String(),
 		Type:      taskType,
 		Payload:   payload,
-		Status:    task.StatusPending,
+		Status:    models.StatusPending,
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 		Retry:     opts.Retry,
@@ -110,7 +93,7 @@ func (q *Queue) Submit(ctx context.Context, taskType string, payload string, opt
 	}
 
 	// 保存任务信息
-	if err := q.redis.SaveTask(ctx, t); err != nil {
+	if err := q.taskManager.SaveTask(ctx, t); err != nil {
 		return "", fmt.Errorf("保存任务失败: %w", err)
 	}
 
@@ -129,7 +112,7 @@ func (q *Queue) Submit(ctx context.Context, taskType string, payload string, opt
 
 // submitToSimpleQueue 提交到简单队列 (FIFO)
 func (q *Queue) submitToSimpleQueue(ctx context.Context, t *task.Task) (string, error) {
-	if err := q.redis.EnqueueTask(ctx, t.ID); err != nil {
+	if err := q.taskManager.EnqueueTask(ctx, t.ID); err != nil {
 		return "", fmt.Errorf("任务入队失败: %w", err)
 	}
 	q.logger.Sugar().Infof("简单队列任务已提交: %s", t.ID)
@@ -137,7 +120,7 @@ func (q *Queue) submitToSimpleQueue(ctx context.Context, t *task.Task) (string, 
 }
 
 // submitToDelayedQueue 提交到延迟队列
-func (q *Queue) submitToDelayedQueue(ctx context.Context, t *task.Task, opts *TaskOptions) (string, error) {
+func (q *Queue) submitToDelayedQueue(ctx context.Context, t *task.Task, opts *task.TaskOptions) (string, error) {
 	var executeAt time.Time
 	if opts.Delay > 0 {
 		executeAt = time.Now().Add(opts.Delay)
@@ -145,7 +128,7 @@ func (q *Queue) submitToDelayedQueue(ctx context.Context, t *task.Task, opts *Ta
 		executeAt = time.Now() // 立即执行
 	}
 
-	if err := q.redis.EnqueueDelayedTask(ctx, t.ID, executeAt, 5); err != nil { // 延迟队列不需要优先级
+	if err := q.taskManager.EnqueueDelayedTask(ctx, t.ID, executeAt, 5); err != nil { // 延迟队列不需要优先级
 		return "", fmt.Errorf("延迟任务入队失败: %w", err)
 	}
 
@@ -158,18 +141,18 @@ func (q *Queue) submitToDelayedQueue(ctx context.Context, t *task.Task, opts *Ta
 }
 
 // submitToPriorityQueue 提交到优先级队列
-func (q *Queue) submitToPriorityQueue(ctx context.Context, t *task.Task, opts *TaskOptions) (string, error) {
+func (q *Queue) submitToPriorityQueue(ctx context.Context, t *task.Task, opts *task.TaskOptions) (string, error) {
 	priority := opts.Priority
 	if priority == 0 {
 		priority = 5 // 默认优先级
 	}
 
 	t.SetPriority(priority)
-	if err := q.redis.UpdateTask(ctx, t); err != nil {
+	if err := q.taskManager.UpdateTask(ctx, t); err != nil {
 		q.logger.Sugar().Infof("更新任务优先级失败: %v", err)
 	}
 
-	if err := q.redis.EnqueueTaskWithPriority(ctx, t.ID, priority); err != nil {
+	if err := q.taskManager.EnqueueTaskWithPriority(ctx, t.ID, priority); err != nil {
 		return "", fmt.Errorf("优先级任务入队失败: %w", err)
 	}
 	q.logger.Sugar().Infof("优先级队列任务已提交: %s (优先级: %d)", t.ID, priority)
@@ -197,7 +180,7 @@ func (q *Queue) Start(ctx context.Context) error {
 	// 启动工作器
 	for i := 0; i < q.workerNumber; i++ {
 		workerID := fmt.Sprintf("worker-%d", i+1)
-		wk := worker.NewWorker(ctx, q.logger, workerID, q.queueType, q.redis)
+		wk := worker.NewWorker(ctx, q.logger, workerID, q.queueType, q.taskManager, q.handlerManager)
 
 		q.workers[workerID] = wk
 		q.wg.Add(1)
@@ -224,8 +207,8 @@ func (q *Queue) Stop() {
 	q.logger.Sugar().Infof("正在停止 %s 队列...", q.queueType)
 
 	// 停止所有工作器
-	for _, worker := range q.workers {
-		worker.Close()
+	for _, wk := range q.workers {
+		wk.Stop()
 	}
 
 	// 发送停止信号
@@ -267,7 +250,7 @@ func (q *Queue) processExpiredDelayedTasks(ctx context.Context) error {
 	delayedKey := "task:queue:delayed"
 	now := time.Now().Unix() * 1000
 
-	tasks, err := q.redis.GetClient().ZRangeByScore(ctx, delayedKey, &goredis.ZRangeBy{
+	tasks, err := q.taskManager.GetRedisClient().ZRangeByScore(ctx, delayedKey, &redis.ZRangeBy{
 		Min: "0",
 		Max: fmt.Sprintf("%d", now),
 	}).Result()
@@ -277,7 +260,7 @@ func (q *Queue) processExpiredDelayedTasks(ctx context.Context) error {
 	}
 
 	// 移动到期任务供工作器处理
-	pipe := q.redis.GetClient().Pipeline()
+	pipe := q.taskManager.GetRedisClient().Pipeline()
 	for _, taskID := range tasks {
 		// 添加到待处理列表
 		pipe.LPush(ctx, "task:queue:ready", taskID)
@@ -297,35 +280,35 @@ func (q *Queue) GetStats(ctx context.Context) (map[string]interface{}, error) {
 	stats := map[string]interface{}{
 		"queue_type": string(q.queueType),
 		"workers":    len(q.workers),
-		"handlers":   len(q.handlers),
+		"handlers":   q.handlerManager.GetHandlerCount(),
 		"running":    q.running,
 	}
 
 	// 根据队列类型获取不同的统计信息
 	switch q.queueType {
 	case models.SimpleQueue:
-		length, err := q.redis.GetQueueLength(ctx)
+		length, err := q.taskManager.GetQueueLength(ctx)
 		if err != nil {
 			return nil, err
 		}
 		stats["queue_length"] = length
 
 	case models.DelayedQueue:
-		delayedCount, err := q.redis.GetDelayedTaskCount(ctx)
+		delayedCount, err := q.taskManager.GetDelayedTaskCount(ctx)
 		if err != nil {
 			return nil, err
 		}
 		stats["delayed_tasks"] = delayedCount
 
 		// 获取ready队列长度
-		readyLength, err := q.redis.GetClient().LLen(ctx, "task:queue:ready").Result()
+		readyLength, err := q.taskManager.GetRedisClient().LLen(ctx, "task:queue:ready").Result()
 		if err != nil {
 			return nil, err
 		}
 		stats["ready_tasks"] = readyLength
 
 	case models.PriorityQueue:
-		priorityLength, err := q.redis.GetClient().ZCard(ctx, "task:queue:priority").Result()
+		priorityLength, err := q.taskManager.GetRedisClient().ZCard(ctx, "task:queue:priority").Result()
 		if err != nil {
 			return nil, err
 		}
@@ -338,4 +321,9 @@ func (q *Queue) GetStats(ctx context.Context) (map[string]interface{}, error) {
 // GetQueueType 获取队列类型
 func (q *Queue) GetQueueType() models.QueueType {
 	return q.queueType
+}
+
+// GetHandlerManager 获取处理器管理器
+func (q *Queue) GetHandlerManager() *handler_manager.HandlerManager {
+	return q.handlerManager
 }

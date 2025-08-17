@@ -3,9 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	queue2 "github.com/minhyannv/task-go/internal/queue"
 	"log"
 	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/minhyannv/task-go/internal/task"
 	taskqueue "github.com/minhyannv/task-go/pkg"
@@ -21,7 +22,7 @@ func main() {
 	redisDB := 0
 
 	// 示例1: 简单队列 - FIFO 处理
-	fmt.Printf("📋 示例1: 简单队列 (FIFO)\n")
+	fmt.Printf("\n📋 示例1: 简单队列 (FIFO)\n")
 	runSimpleQueueExample(redisAddr, redisPass, redisDB)
 
 	time.Sleep(2 * time.Second)
@@ -41,8 +42,10 @@ func main() {
 
 // 示例1: 简单队列
 func runSimpleQueueExample(addr, pass string, db int) {
+	ctx := context.Background()
+	logger, _ := zap.NewProduction()
 	// 创建简单队列
-	queue, err := taskqueue.NewSimpleTaskQueue(addr, pass, db)
+	queue, err := taskqueue.NewSimpleTaskQueue(ctx, logger, addr, pass, db)
 	if err != nil {
 		log.Printf("❌ 创建简单队列失败: %v", err)
 		return
@@ -108,8 +111,10 @@ func runSimpleQueueExample(addr, pass string, db int) {
 
 // 示例2: 延迟队列
 func runDelayedQueueExample(addr, pass string, db int) {
+	ctx := context.Background()
+	logger, _ := zap.NewProduction()
 	// 创建延迟队列
-	queue, err := taskqueue.NewDelayedTaskQueue(addr, pass, db)
+	queue, err := taskqueue.NewDelayedTaskQueue(ctx, logger, addr, pass, db)
 	if err != nil {
 		log.Printf("❌ 创建延迟队列失败: %v", err)
 		return
@@ -139,7 +144,7 @@ func runDelayedQueueExample(addr, pass string, db int) {
 		"type": "meeting",
 		"message": "会议将在10分钟后开始",
 		"user": "张三"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Delay: 3 * time.Second,
 	})
 	fmt.Printf("✅ 3秒后执行提醒任务: %s\n", taskID1[:8]+"...")
@@ -149,7 +154,7 @@ func runDelayedQueueExample(addr, pass string, db int) {
 		"order_id": "ORD002",
 		"action": "cancel_unpaid_order",
 		"timeout": "30分钟"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Delay: 6 * time.Second,
 	})
 	fmt.Printf("✅ 6秒后执行超时任务: %s\n", taskID2[:8]+"...")
@@ -159,7 +164,7 @@ func runDelayedQueueExample(addr, pass string, db int) {
 		"type": "notification",
 		"message": "您有新消息",
 		"user": "李四"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Delay: 1 * time.Second,
 	})
 	fmt.Printf("✅ 1秒后执行通知任务: %s\n", taskID3[:8]+"...")
@@ -176,8 +181,10 @@ func runDelayedQueueExample(addr, pass string, db int) {
 
 // 示例3: 优先级队列
 func runPriorityQueueExample(addr, pass string, db int) {
+	ctx := context.Background()
+	logger, _ := zap.NewProduction()
 	// 创建优先级队列
-	queue, err := taskqueue.NewPriorityTaskQueue(addr, pass, db)
+	queue, err := taskqueue.NewPriorityTaskQueue(ctx, logger, addr, pass, db)
 	if err != nil {
 		log.Printf("❌ 创建优先级队列失败: %v", err)
 		return
@@ -185,7 +192,6 @@ func runPriorityQueueExample(addr, pass string, db int) {
 
 	// 启动队列
 	ctx, cancel := context.WithCancel(context.Background())
-	queue.Start(ctx)
 
 	// 注册紧急任务处理器
 	queue.RegisterHandler("urgent", func(ctx context.Context, t *task.Task) (string, error) {
@@ -213,7 +219,7 @@ func runPriorityQueueExample(addr, pass string, db int) {
 		"action": "delete_old_logs",
 		"days": 30,
 		"size": "1GB"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Priority: 2,
 	}) // 低优先级
 	fmt.Printf("✅ 低优先级任务已提交: %s (优先级: 2)\n", taskID1[:8]+"...")
@@ -223,7 +229,7 @@ func runPriorityQueueExample(addr, pass string, db int) {
 		"action": "send_newsletter",
 		"recipients": 1000,
 		"template": "monthly"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Priority: 5,
 	}) // 中等优先级
 	fmt.Printf("✅ 普通优先级任务已提交: %s (优先级: 5)\n", taskID2[:8]+"...")
@@ -233,7 +239,7 @@ func runPriorityQueueExample(addr, pass string, db int) {
 		"action": "security_alert",
 		"level": "critical",
 		"message": "检测到异常登录"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Priority: 9,
 	}) // 高优先级
 	fmt.Printf("✅ 紧急任务已提交: %s (优先级: 9)\n", taskID3[:8]+"...")
@@ -242,13 +248,14 @@ func runPriorityQueueExample(addr, pass string, db int) {
 	taskID4, _ := queue.Submit(ctx, "normal", `{
 		"action": "backup_database",
 		"type": "incremental"
-	}`, &queue2.TaskOptions{
+	}`, &task.TaskOptions{
 		Priority: 6,
 	}) // 中等偏高优先级
 	fmt.Printf("✅ 备份任务已提交: %s (优先级: 6)\n", taskID4[:8]+"...")
 
 	fmt.Printf("📋 执行顺序应该是: 紧急任务(9) → 备份任务(6) → 普通任务(5) → 清理任务(2)\n")
 
+	queue.Start(ctx) //启动执行
 	// 等待任务完成
 	time.Sleep(6 * time.Second)
 

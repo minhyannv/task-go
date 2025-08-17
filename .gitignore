@@ -49,5 +49,8 @@ examples/*/main
 
 # Temporary files
 /tmp/
-*.tmp 
+*.tmp
+
+
+.env
  
