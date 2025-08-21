@@ -31,13 +31,11 @@ test:
 example:
 	@echo "运行基础示例..."
 	@echo "请确保 Redis 服务运行在 localhost:6379"
-	cd examples/basic && go run main.go
+	@echo "提示：可以复制 examples/env.example 为 examples/.env 来自定义配置"
+	cd examples && go run main.go
 
-# 运行异步队列示例
-async-example:
-	@echo "运行异步队列示例..."
-	@echo "请确保 Redis 服务运行在 localhost:6379"
-	cd examples/async_queue && go run main.go
+# 运行异步队列示例（与基础示例相同）
+async-example: example
 
 # 清理
 clean:

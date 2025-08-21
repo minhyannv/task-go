@@ -8,7 +8,6 @@
 - ⚡ **高性能** - 基于 Redis，支持高并发
 - 🔄 **自动重试** - 指数退避重试机制
 - ⏰ **延迟任务** - 支持任务延迟执行
-- 🔐 **唯一键** - 防止重复任务提交
 - 👥 **并发处理** - 多工作器并发执行
 - 📊 **状态跟踪** - 完整的任务生命周期管理
 
@@ -32,7 +31,47 @@ go get github.com/minhyannv/task-go
 
 ### 基础使用
 
-参考 ```bash examples/main.go```
+```go
+package main
+
+import (
+    "context"
+    "log"
+    
+    taskgo "github.com/minhyannv/task-go"
+    "github.com/minhyannv/task-go/internal/task"
+)
+
+func main() {
+    ctx := context.Background()
+    
+    // 创建客户端
+    client, err := taskgo.NewClient(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+    
+    // 注册处理器
+    client.RegisterHandler("send_email", func(ctx context.Context, t *task.Task) (string, error) {
+        // 处理邮件发送逻辑
+        return "邮件已发送", nil
+    })
+    
+    // 启动客户端
+    if err := client.Start(); err != nil {
+        log.Fatal(err)
+    }
+    
+    // 提交任务
+    client.SubmitSimpleTask(ctx, "send_email", `{"to":"user@example.com"}`)
+    
+    // 阻塞等待
+    select {}
+}
+```
+
+更多示例请参考 `examples/main.go`
 
 ## 📊 任务状态
 

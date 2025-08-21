@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/minhyannv/task-go/internal/handler_manager"
 	"github.com/minhyannv/task-go/internal/models"
@@ -43,11 +44,15 @@ func NewWorker(ctx context.Context, logger *zap.Logger, id string, queueType mod
 
 // Run 工作器运行
 func (w *Worker) Run(ctx context.Context) {
-	if w.running == true {
+	w.mu.Lock()
+	if w.running {
+		w.mu.Unlock()
 		w.logger.Sugar().Warnf("工作器: %s 已经在运行", w.id)
 		return
 	}
 	w.running = true
+	w.mu.Unlock()
+
 	w.logger.Sugar().Infof("工作器 %s 启动 (队列类型: %s)", w.id, w.queueType)
 
 	for {
@@ -84,12 +89,11 @@ func (w *Worker) processNextTask(ctx context.Context) error {
 	// 根据队列类型获取任务
 	switch w.queueType {
 	case models.SimpleQueue:
-		taskID, err = w.taskManager.DequeueTask(ctx, time.Second)
-	case models.DelayedQueue:
-		// 延迟队列从ready队列获取已到期的任务
-		taskID, err = w.taskManager.DequeueFromReadyQueue(ctx, time.Second)
+		taskID, err = w.taskManager.DequeueSimpleTask(ctx, time.Second)
+	case models.DelayQueue:
+		taskID, err = w.taskManager.DequeueDelayTask(ctx, time.Second)
 	case models.PriorityQueue:
-		taskID, err = w.taskManager.DequeueTaskWithPriority(ctx, time.Second)
+		taskID, err = w.taskManager.DequeuePriorityTask(ctx, time.Second)
 	default:
 		return fmt.Errorf("不支持的队列类型: %s", w.queueType)
 	}
@@ -137,43 +141,61 @@ func (w *Worker) executeTaskWithRetry(ctx context.Context, t *task.Task, handler
 		return err
 	}
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			w.logger.Sugar().Infof("任务 %s 第 %d 次重试", t.ID, attempt)
-			// 指数退避
-			backoff := time.Duration(attempt*attempt) * time.Second
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
+	// 执行任务一次
+	res, err := w.executeTaskOnce(ctx, t, handler, timeout)
+	if err == nil {
+		// 更新任务状态：已完成
+		if updateErr := w.taskManager.TaskSuccess(ctx, t.ID, res); updateErr != nil {
+			w.logger.Sugar().Errorf("更新任务完成状态失败: %v", updateErr)
 		}
-
-		// 执行任务
-		res, err := w.executeTaskOnce(ctx, t, handler, timeout)
-		if err == nil {
-			// 更新任务状态：已完成
-			if updateErr := w.taskManager.TaskSuccess(ctx, t.ID, res); updateErr != nil {
-				w.logger.Sugar().Errorf("更新任务完成状态失败: %v", updateErr)
-			}
-			w.logger.Sugar().Infof("任务 %s 执行成功 (队列: %s)", t.ID, w.queueType)
-			return nil
-		}
-
-		w.logger.Sugar().Errorf("任务 %s 执行失败 (第 %d/%d 次): %v", t.ID, attempt+1, maxRetries+1, err)
-
-		// 最后一次尝试失败
-		if attempt == maxRetries {
-			// 更新任务状态：已失败
-			err = w.taskManager.TaskError(ctx, t.ID, err.Error())
-			if err != nil {
-				w.logger.Sugar().Errorf("更新任务失败状态失败: %v", err)
-			}
-			return fmt.Errorf("任务 %s 最终执行失败: %w", t.ID, err)
-		}
+		w.logger.Sugar().Infof("任务 %s 执行成功 (队列: %s)", t.ID, w.queueType)
+		return nil
 	}
 
-	return nil
+	w.logger.Sugar().Errorf("任务 %s 执行失败: %v", t.ID, err)
+
+	// 检查是否还有重试次数
+	if t.Retry > 0 {
+		// 减少重试次数并重新入队
+		t.Retry--
+		t.UpdatedAt = time.Now()
+
+		// 添加退避延迟（指数退避）
+		originalRetries := maxRetries
+		currentAttempt := originalRetries - t.Retry
+		backoffDelay := time.Duration(currentAttempt*currentAttempt) * time.Second
+		t.Delay = backoffDelay
+
+		w.logger.Sugar().Infof("任务 %s 重新入队，剩余重试次数: %d，延迟: %v", t.ID, t.Retry, backoffDelay)
+
+		// 根据队列类型重新入队
+		var requeueErr error
+		switch t.QueueType {
+		case models.SimpleQueue:
+			requeueErr = w.taskManager.EnqueueSimpleTask(ctx, t)
+		case models.DelayQueue:
+			requeueErr = w.taskManager.EnqueueDelayTask(ctx, t)
+		case models.PriorityQueue:
+			requeueErr = w.taskManager.EnqueuePriorityTask(ctx, t)
+		}
+
+		if requeueErr != nil {
+			w.logger.Sugar().Errorf("任务 %s 重新入队失败: %v", t.ID, requeueErr)
+			// 重新入队失败，标记为失败
+			if updateErr := w.taskManager.TaskError(ctx, t.ID, fmt.Sprintf("重新入队失败: %v", requeueErr)); updateErr != nil {
+				w.logger.Sugar().Errorf("更新任务失败状态失败: %v", updateErr)
+			}
+			return fmt.Errorf("任务 %s 重新入队失败: %w", t.ID, requeueErr)
+		}
+
+		return nil
+	}
+
+	// 没有重试次数了，标记为失败
+	if updateErr := w.taskManager.TaskError(ctx, t.ID, err.Error()); updateErr != nil {
+		w.logger.Sugar().Errorf("更新任务失败状态失败: %v", updateErr)
+	}
+	return fmt.Errorf("任务 %s 最终执行失败: %w", t.ID, err)
 }
 
 // executeTaskOnce 执行任务一次
@@ -189,6 +211,7 @@ func (w *Worker) executeTaskOnce(ctx context.Context, t *task.Task, handler task
 		res, err := handler(timeoutCtx, t)
 		if err != nil {
 			errChan <- err
+			return // 修复：有错误时不应该继续发送结果
 		}
 		resChan <- res
 	}()
@@ -204,5 +227,22 @@ func (w *Worker) executeTaskOnce(ctx context.Context, t *task.Task, handler task
 }
 
 func (w *Worker) Stop() {
-	close(w.stopCh)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.running {
+		return
+	}
+
+	w.running = false
+
+	// 安全关闭channel，避免重复关闭
+	select {
+	case <-w.stopCh:
+		// channel已经关闭
+	default:
+		close(w.stopCh)
+	}
+
+	w.logger.Sugar().Infof("工作器 %s 已停止", w.id)
 }

@@ -2,265 +2,257 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
 
+	taskgo "github.com/minhyannv/task-go"
+	"github.com/minhyannv/task-go/internal/config"
 	"github.com/minhyannv/task-go/internal/task"
-	taskqueue "github.com/minhyannv/task-go/pkg"
 )
 
+// EmailPayload 邮件任务载荷
+type EmailPayload struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+	Body    string `json:"body"`
+}
+
+// SMSPayload 短信任务载荷
+type SMSPayload struct {
+	Phone   string `json:"phone"`
+	Message string `json:"message"`
+}
+
+// ReportPayload 报告任务载荷
+type ReportPayload struct {
+	UserID   int    `json:"user_id"`
+	ReportID string `json:"report_id"`
+	Type     string `json:"type"`
+}
+
 func main() {
-	fmt.Printf("🎉 TaskGo 使用示例\n")
-	fmt.Printf("================\n\n")
+	// 创建上下文
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// Redis 连接信息
-	redisAddr := "localhost:6379"
-	redisPass := "123456"
-	redisDB := 0
-
-	// 示例1: 简单队列 - FIFO 处理
-	fmt.Printf("\n📋 示例1: 简单队列 (FIFO)\n")
-	runSimpleQueueExample(redisAddr, redisPass, redisDB)
-
-	time.Sleep(2 * time.Second)
-
-	// 示例2: 延迟队列 - 定时执行
-	fmt.Printf("\n📋 示例2: 延迟队列 (定时执行)\n")
-	runDelayedQueueExample(redisAddr, redisPass, redisDB+1)
-
-	time.Sleep(2 * time.Second)
-
-	// 示例3: 优先级队列 - 重要任务优先
-	fmt.Printf("\n📋 示例3: 优先级队列 (优先级调度)\n")
-	runPriorityQueueExample(redisAddr, redisPass, redisDB+2)
-
-	fmt.Printf("\n🎉 所有示例完成！\n")
-}
-
-// 示例1: 简单队列
-func runSimpleQueueExample(addr, pass string, db int) {
-	ctx := context.Background()
-	logger, _ := zap.NewProduction()
-	// 创建简单队列
-	queue, err := taskqueue.NewSimpleTaskQueue(ctx, logger, addr, pass, db)
+	// 创建日志器
+	logger, err := zap.NewDevelopment()
 	if err != nil {
-		log.Printf("❌ 创建简单队列失败: %v", err)
-		return
+		log.Fatalf("创建日志器失败: %v", err)
+	}
+	defer logger.Sync()
+
+	// 加载配置（可以从环境变量或配置文件）
+	cfg, err := config.LoadFromEnv()
+	if err != nil {
+		logger.Fatal("加载配置失败", zap.Error(err))
 	}
 
-	// 启动队列
-	ctx, cancel := context.WithCancel(context.Background())
-	queue.Start(ctx)
-
-	// 注册邮件处理器
-	queue.RegisterHandler("email", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("📧 [简单队列] 发送邮件: %s\n", t.Payload)
-		time.Sleep(500 * time.Millisecond) // 模拟处理时间
-		return t.Payload, nil
-	})
-
-	// 注册订单处理器
-	queue.RegisterHandler("order", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("📦 [简单队列] 处理订单: %s\n", t.Payload)
-		time.Sleep(800 * time.Millisecond)
-		return t.Payload, nil
-	})
-
-	// 提交任务（按 FIFO 顺序执行）
-	fmt.Printf("🚀 提交任务到简单队列...\n")
-
-	// 任务1: 邮件
-	taskID1, _ := queue.Submit(ctx, "email", `{
-		"to": "user@example.com",
-		"subject": "欢迎注册",
-		"body": "感谢您的注册！"
-	}`, nil)
-	fmt.Printf("✅ 邮件任务已提交: %s\n", taskID1[:8]+"...")
-
-	// 任务2: 订单
-	taskID2, _ := queue.Submit(ctx, "order", `{
-		"order_id": "ORD001",
-		"amount": 299.99,
-		"items": ["商品A", "商品B"]
-	}`, nil)
-	fmt.Printf("✅ 订单任务已提交: %s\n", taskID2[:8]+"...")
-
-	// 任务3: 邮件
-	taskID3, _ := queue.Submit(ctx, "email", `{
-		"to": "admin@example.com",
-		"subject": "新订单通知",
-		"body": "有新订单需要处理"
-	}`, nil)
-	fmt.Printf("✅ 通知任务已提交: %s\n", taskID3[:8]+"...")
-
-	// 等待任务完成
-	time.Sleep(5 * time.Second)
-
-	// 获取统计信息
-	stats, _ := queue.GetQueueStats(ctx)
-	fmt.Printf("📊 队列统计: %+v\n", stats)
-
-	// 停止队列
-	cancel()
-	queue.Stop()
-	fmt.Printf("✅ 简单队列示例完成\n")
-}
-
-// 示例2: 延迟队列
-func runDelayedQueueExample(addr, pass string, db int) {
-	ctx := context.Background()
-	logger, _ := zap.NewProduction()
-	// 创建延迟队列
-	queue, err := taskqueue.NewDelayedTaskQueue(ctx, logger, addr, pass, db)
+	// 创建TaskGo客户端
+	client, err := taskgo.NewClient(ctx,
+		taskgo.WithConfig(cfg),
+		taskgo.WithLogger(logger),
+	)
 	if err != nil {
-		log.Printf("❌ 创建延迟队列失败: %v", err)
-		return
+		logger.Fatal("创建TaskGo客户端失败", zap.Error(err))
+	}
+	defer client.Close()
+
+	// 注册任务处理器
+	registerHandlers(client, logger)
+
+	// 启动客户端
+	if err := client.Start(); err != nil {
+		logger.Fatal("启动TaskGo客户端失败", zap.Error(err))
 	}
 
-	// 启动队列
-	ctx, cancel := context.WithCancel(context.Background())
-	queue.Start(ctx)
+	// 提交示例任务
+	submitExampleTasks(ctx, client, logger)
 
-	// 注册提醒处理器
-	queue.RegisterHandler("reminder", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("⏰ [延迟队列] 提醒任务: %s\n", t.Payload)
-		return t.Payload, nil
-	})
+	// 设置优雅关闭
+	setupGracefulShutdown(ctx, cancel, client, logger)
 
-	// 注册超时处理器
-	queue.RegisterHandler("timeout", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("⌛ [延迟队列] 超时处理: %s\n", t.Payload)
-		return t.Payload, nil
-	})
-
-	// 提交延迟任务
-	fmt.Printf("🚀 提交延迟任务...\n")
-
-	// 任务1: 3秒后提醒
-	taskID1, _ := queue.Submit(ctx, "reminder", `{
-		"type": "meeting",
-		"message": "会议将在10分钟后开始",
-		"user": "张三"
-	}`, &task.TaskOptions{
-		Delay: 3 * time.Second,
-	})
-	fmt.Printf("✅ 3秒后执行提醒任务: %s\n", taskID1[:8]+"...")
-
-	// 任务2: 6秒后超时处理
-	taskID2, _ := queue.Submit(ctx, "timeout", `{
-		"order_id": "ORD002",
-		"action": "cancel_unpaid_order",
-		"timeout": "30分钟"
-	}`, &task.TaskOptions{
-		Delay: 6 * time.Second,
-	})
-	fmt.Printf("✅ 6秒后执行超时任务: %s\n", taskID2[:8]+"...")
-
-	// 任务3: 1秒后提醒（最先执行）
-	taskID3, _ := queue.Submit(ctx, "reminder", `{
-		"type": "notification",
-		"message": "您有新消息",
-		"user": "李四"
-	}`, &task.TaskOptions{
-		Delay: 1 * time.Second,
-	})
-	fmt.Printf("✅ 1秒后执行通知任务: %s\n", taskID3[:8]+"...")
-
-	// 等待所有延迟任务完成
-	fmt.Printf("⏳ 等待延迟任务执行...\n")
-	time.Sleep(8 * time.Second)
-
-	// 停止队列
-	cancel()
-	queue.Stop()
-	fmt.Printf("✅ 延迟队列示例完成\n")
+	// 定期打印统计信息
+	printStats(ctx, client, logger)
 }
 
-// 示例3: 优先级队列
-func runPriorityQueueExample(addr, pass string, db int) {
-	ctx := context.Background()
-	logger, _ := zap.NewProduction()
-	// 创建优先级队列
-	queue, err := taskqueue.NewPriorityTaskQueue(ctx, logger, addr, pass, db)
-	if err != nil {
-		log.Printf("❌ 创建优先级队列失败: %v", err)
-		return
+// registerHandlers 注册任务处理器
+func registerHandlers(client *taskgo.Client, logger *zap.Logger) {
+	// 注册邮件发送处理器
+	client.RegisterHandler("send_email", func(ctx context.Context, t *task.Task) (string, error) {
+		var payload EmailPayload
+		if err := json.Unmarshal([]byte(t.Payload), &payload); err != nil {
+			return "", fmt.Errorf("解析邮件载荷失败: %w", err)
+		}
+
+		logger.Info("发送邮件",
+			zap.String("task_id", t.ID),
+			zap.String("to", payload.To),
+			zap.String("subject", payload.Subject),
+		)
+
+		// 模拟邮件发送
+		time.Sleep(100 * time.Millisecond)
+
+		return fmt.Sprintf("邮件已发送到 %s", payload.To), nil
+	})
+
+	// 注册短信发送处理器
+	client.RegisterHandler("send_sms", func(ctx context.Context, t *task.Task) (string, error) {
+		var payload SMSPayload
+		if err := json.Unmarshal([]byte(t.Payload), &payload); err != nil {
+			return "", fmt.Errorf("解析短信载荷失败: %w", err)
+		}
+
+		logger.Info("发送短信",
+			zap.String("task_id", t.ID),
+			zap.String("phone", payload.Phone),
+			zap.String("message", payload.Message),
+		)
+
+		// 模拟短信发送
+		time.Sleep(200 * time.Millisecond)
+
+		return fmt.Sprintf("短信已发送到 %s", payload.Phone), nil
+	})
+
+	// 注册报告生成处理器（高优先级任务）
+	client.RegisterHandler("generate_report", func(ctx context.Context, t *task.Task) (string, error) {
+		var payload ReportPayload
+		if err := json.Unmarshal([]byte(t.Payload), &payload); err != nil {
+			return "", fmt.Errorf("解析报告载荷失败: %w", err)
+		}
+
+		logger.Info("生成报告",
+			zap.String("task_id", t.ID),
+			zap.Int("user_id", payload.UserID),
+			zap.String("report_id", payload.ReportID),
+			zap.String("type", payload.Type),
+		)
+
+		// 模拟报告生成
+		time.Sleep(500 * time.Millisecond)
+
+		return fmt.Sprintf("报告 %s 已生成", payload.ReportID), nil
+	})
+
+	// 注册可能失败的任务处理器（用于测试重试机制）
+	client.RegisterHandler("flaky_task", func(ctx context.Context, t *task.Task) (string, error) {
+		logger.Info("执行不稳定任务", zap.String("task_id", t.ID))
+
+		// 模拟50%的失败率
+		if time.Now().UnixNano()%2 == 0 {
+			return "", fmt.Errorf("任务随机失败")
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		return "不稳定任务执行成功", nil
+	})
+}
+
+// submitExampleTasks 提交示例任务
+func submitExampleTasks(ctx context.Context, client *taskgo.Client, logger *zap.Logger) {
+	logger.Info("提交示例任务...")
+
+	// 提交简单任务（邮件发送）
+	for i := 0; i < 5; i++ {
+		emailPayload := EmailPayload{
+			To:      fmt.Sprintf("user%d@example.com", i+1),
+			Subject: fmt.Sprintf("欢迎信 #%d", i+1),
+			Body:    "欢迎使用我们的服务！",
+		}
+		payloadBytes, _ := json.Marshal(emailPayload)
+
+		if err := client.SubmitSimpleTask(ctx, "send_email", string(payloadBytes)); err != nil {
+			logger.Error("提交邮件任务失败", zap.Error(err))
+		}
 	}
 
-	// 启动队列
-	ctx, cancel := context.WithCancel(context.Background())
+	// 提交延迟任务（短信发送，5秒后执行）
+	for i := 0; i < 3; i++ {
+		smsPayload := SMSPayload{
+			Phone:   fmt.Sprintf("138000%05d", i+1),
+			Message: fmt.Sprintf("您的验证码是：%06d", (i+1)*123456),
+		}
+		payloadBytes, _ := json.Marshal(smsPayload)
 
-	// 注册紧急任务处理器
-	queue.RegisterHandler("urgent", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("🚨 [优先级队列] 紧急任务: %s\n", t.Payload)
-		return t.Payload, nil
-	})
+		delay := time.Duration(i+1) * 5 * time.Second
+		if err := client.SubmitDelayTask(ctx, "send_sms", string(payloadBytes), delay); err != nil {
+			logger.Error("提交短信任务失败", zap.Error(err))
+		}
+	}
 
-	// 注册普通任务处理器
-	queue.RegisterHandler("normal", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("📝 [优先级队列] 普通任务: %s\n", t.Payload)
-		return t.Payload, nil
-	})
+	// 提交优先级任务（报告生成，高优先级）
+	for i := 0; i < 3; i++ {
+		reportPayload := ReportPayload{
+			UserID:   1000 + i,
+			ReportID: fmt.Sprintf("RPT-%d", time.Now().Unix()+int64(i)),
+			Type:     "monthly",
+		}
+		payloadBytes, _ := json.Marshal(reportPayload)
 
-	// 注册低优先级任务处理器
-	queue.RegisterHandler("cleanup", func(ctx context.Context, t *task.Task) (string, error) {
-		fmt.Printf("🧹 [优先级队列] 清理任务: %s\n", t.Payload)
-		return t.Payload, nil
-	})
+		priority := 10 - i // 优先级递减
+		if err := client.SubmitPriorityTask(ctx, "generate_report", string(payloadBytes), priority); err != nil {
+			logger.Error("提交报告任务失败", zap.Error(err))
+		}
+	}
 
-	// 提交不同优先级的任务（注意：先提交低优先级，后提交高优先级）
-	fmt.Printf("🚀 提交不同优先级任务...\n")
+	// 提交一些可能失败的任务（测试重试机制）
+	for i := 0; i < 3; i++ {
+		if err := client.SubmitSimpleTaskWithOptions(ctx, "flaky_task", fmt.Sprintf("payload-%d", i), &taskgo.TaskOptions{
+			Retry: intPtr(2), // 重试2次
+		}); err != nil {
+			logger.Error("提交不稳定任务失败", zap.Error(err))
+		}
+	}
 
-	// 任务1: 低优先级清理任务
-	taskID1, _ := queue.Submit(ctx, "cleanup", `{
-		"action": "delete_old_logs",
-		"days": 30,
-		"size": "1GB"
-	}`, &task.TaskOptions{
-		Priority: 2,
-	}) // 低优先级
-	fmt.Printf("✅ 低优先级任务已提交: %s (优先级: 2)\n", taskID1[:8]+"...")
+	logger.Info("所有示例任务已提交")
+}
 
-	// 任务2: 普通任务
-	taskID2, _ := queue.Submit(ctx, "normal", `{
-		"action": "send_newsletter",
-		"recipients": 1000,
-		"template": "monthly"
-	}`, &task.TaskOptions{
-		Priority: 5,
-	}) // 中等优先级
-	fmt.Printf("✅ 普通优先级任务已提交: %s (优先级: 5)\n", taskID2[:8]+"...")
+// setupGracefulShutdown 设置优雅关闭
+func setupGracefulShutdown(_ context.Context, cancel context.CancelFunc, client *taskgo.Client, logger *zap.Logger) {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
-	// 任务3: 紧急任务（最后提交但最先执行）
-	taskID3, _ := queue.Submit(ctx, "urgent", `{
-		"action": "security_alert",
-		"level": "critical",
-		"message": "检测到异常登录"
-	}`, &task.TaskOptions{
-		Priority: 9,
-	}) // 高优先级
-	fmt.Printf("✅ 紧急任务已提交: %s (优先级: 9)\n", taskID3[:8]+"...")
+	go func() {
+		<-c
+		logger.Info("收到关闭信号，正在优雅关闭...")
+		cancel()
+		client.Stop()
+		logger.Info("TaskGo客户端已关闭")
+		os.Exit(0)
+	}()
+}
 
-	// 再添加一个中等优先级任务
-	taskID4, _ := queue.Submit(ctx, "normal", `{
-		"action": "backup_database",
-		"type": "incremental"
-	}`, &task.TaskOptions{
-		Priority: 6,
-	}) // 中等偏高优先级
-	fmt.Printf("✅ 备份任务已提交: %s (优先级: 6)\n", taskID4[:8]+"...")
+// printStats 定期打印统计信息
+func printStats(ctx context.Context, client *taskgo.Client, logger *zap.Logger) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-	fmt.Printf("📋 执行顺序应该是: 紧急任务(9) → 备份任务(6) → 普通任务(5) → 清理任务(2)\n")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			stats, err := client.GetStats(ctx)
+			if err != nil {
+				logger.Error("获取统计信息失败", zap.Error(err))
+				continue
+			}
 
-	queue.Start(ctx) //启动执行
-	// 等待任务完成
-	time.Sleep(6 * time.Second)
+			logger.Info("TaskGo统计信息", zap.Any("stats", stats))
+		}
+	}
+}
 
-	// 停止队列
-	cancel()
-	queue.Stop()
-	fmt.Printf("✅ 优先级队列示例完成\n")
+// intPtr 返回int指针
+func intPtr(i int) *int {
+	return &i
 }
